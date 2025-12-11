@@ -1,70 +1,49 @@
 # api/webhook.py
-from flask import Flask, request, Response
-import requests
+from fastapi import FastAPI, Request, Response, HTTPException
 import os
+import httpx
+import uvicorn
 
-# ================ CONFIG ====================
-# تم ضبط TARGET_SERVER_URL كما طلبت:
-TARGET_SERVER_URL = os.environ.get("TARGET_SERVER_URL", "http://noel.hidencloud.com:25151/webhook")
-# ===========================================
+app = FastAPI()
 
-app = Flask(__name__)
+# ضع هنا رابط السيرفر الداخلي الذي يستقبل الطلبات (السيرفر الذي لا يدعم HTTPS)
+# يمكنك تغييره لاحقًا عبر متغير بيئة TARGET_SERVER_URL في Vercel
+TARGET_SERVER_URL = os.getenv("TARGET_SERVER_URL", "http://noel.hidencloud.com:25151/webhook")
 
-# نعرّف المسارين لأن بعض المستخدمين يوفّرون المسار مع /api أو بدونها
-@app.route("/api/webhook", methods=["GET", "POST"])
-@app.route("/webhook", methods=["GET", "POST"])
-def proxy_webhook():
-    try:
-        # ===== GET: عادة طلب التحقق من فيسبوك (hub.challenge) =====
-        if request.method == "GET":
-            params = request.args.to_dict(flat=True)
-            try:
-                resp = requests.get(TARGET_SERVER_URL, params=params, timeout=10)
-            except requests.exceptions.RequestException as e:
-                return Response(f"❌ فشل الاتصال بالسيرفر الأصلي: {e}", status=502)
+# optional: timeouts
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10.0"))
 
-            content_type = resp.headers.get("Content-Type", "text/plain")
-            return Response(resp.content, status=resp.status_code, content_type=content_type)
+@app.get("/")
+async def index():
+    return {"status": "ok", "note": "Vercel proxy for Djezzy webhook"}
 
-        # ===== POST: فيسبوك يرسل الرسائل هنا =====
-        elif request.method == "POST":
-            # نحاول الحصول على JSON إن وُجد
-            try:
-                json_data = request.get_json(force=False, silent=True)
-            except Exception:
-                json_data = None
+@app.api_route("/webhook", methods=["GET", "POST"])
+async def proxy_webhook(request: Request):
+    """
+    Proxy requests from Facebook (HTTPS) to the internal HTTP server.
+    GET (verification): forward query params and return upstream response.
+    POST (messages): forward JSON payload and return upstream response.
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        try:
+            if request.method == "GET":
+                # forward query parameters
+                params = dict(request.query_params)
+                upstream = await client.get(TARGET_SERVER_URL, params=params)
+                return Response(content=upstream.content, status_code=upstream.status_code,
+                                media_type=upstream.headers.get("content-type", "text/plain"))
 
-            # ننقل بعض الرؤوس المهمة فقط (مثل توقيع الـ webhook لو موجود)
-            forward_headers = {}
-            for h in ("X-Hub-Signature", "X-Hub-Signature-256", "Content-Type"):
-                if h in request.headers:
-                    forward_headers[h] = request.headers[h]
-
-            try:
-                if json_data is not None:
-                    resp = requests.post(TARGET_SERVER_URL, json=json_data, headers=forward_headers, timeout=15)
-                else:
-                    # مرّر الـ body الخام إذا لم يكن JSON
-                    resp = requests.post(TARGET_SERVER_URL, data=request.get_data(), headers=forward_headers, timeout=15)
-            except requests.exceptions.RequestException as e:
-                return Response(f"❌ فشل الاتصال بالسيرفر الأصلي: {e}", status=502)
-
-            content_type = resp.headers.get("Content-Type", "application/json")
-            return Response(resp.content, status=resp.status_code, content_type=content_type)
-
-    except Exception as e:
-        # خطأ عام - سيظهر في سجلات Vercel
-        return Response(f"❌ خطأ داخلي في الويب هوك الوسيط: {str(e)}", status=500)
-
-@app.route("/", methods=["GET"])
-def home():
-    return (
-        f"✅ وسيط Vercel يعمل بنجاح — يقوم بتحويل الطلبات إلى: {TARGET_SERVER_URL}\n"
-        "المسارات المتاحة: /api/webhook و /webhook",
-        200,
-    )
-
-# لا تستدعي app.run() — Vercel يتولى تشغيل المتغيّر `app`.
-# تأكد أن ملف requirements.txt يحتوي:
-# flask
-# requests
+            # POST: forward JSON body and headers (but do not forward hop-by-hop headers)
+            body = await request.body()
+            headers = {}
+            # include content-type if present
+            if "content-type" in request.headers:
+                headers["Content-Type"] = request.headers.get("content-type")
+            # Forward request to internal server
+            upstream = await client.post(TARGET_SERVER_URL, content=body, headers=headers)
+            return Response(content=upstream.content, status_code=upstream.status_code,
+                            media_type=upstream.headers.get("content-type", "application/json"))
+        except httpx.ConnectError:
+            raise HTTPException(status_code=502, detail="❌ فشل الاتصال بالسيرفر الأصلي (TARGET_SERVER_URL)")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"❌ خطأ في الوسيط: {e}")
